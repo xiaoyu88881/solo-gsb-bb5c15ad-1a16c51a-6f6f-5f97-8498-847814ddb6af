@@ -68,8 +68,9 @@ def test_late_out_of_order_event_bumps_revision(client):
     seg = late["segment"]
     assert seg["revision"] == 2
     assert seg["max_severity"] == "error"
-    assert seg["started_at"] == "2026-09-20T08:00:00+00:00"
-    assert seg["ended_at"] == "2026-09-20T08:00:30+00:00"
+    # pydantic 不同版本对 UTC 可能输出 Z 或 +00:00，统一归一化比较
+    assert seg["started_at"].replace("Z", "+00:00") == "2026-09-20T08:00:00+00:00"
+    assert seg["ended_at"].replace("Z", "+00:00") == "2026-09-20T08:00:30+00:00"
     assert seg["event_count"] == 2
 
 
@@ -178,6 +179,138 @@ def test_segment_changes_param_validation(client):
     assert client.get("/segment-changes", params={"after": -1}).status_code == 422
     assert client.get("/segment-changes", params={"limit": 0}).status_code == 422
     assert client.get("/segment-changes", params={"limit": 1001}).status_code == 422
+
+
+def test_preview_split_merge_and_unchanged(client):
+    # silence=60：08:00:00、08:00:30 同段；08:02:00、08:02:30 另一段
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "warning")
+    _post(client, "gw-01", "e2", "2026-09-20T08:00:30Z", "critical")
+    _post(client, "gw-01", "e3", "2026-09-20T08:02:00Z", "info")
+    _post(client, "gw-01", "e4", "2026-09-20T08:02:30Z", "debug")
+
+    # 更小间隔 15s：两段各被拆开 → 4 个模拟段，2 个 split
+    split = client.get(
+        "/segments/resegmentation-preview",
+        params={"source": "gw-01", "silence_interval_seconds": 15},
+    )
+    assert split.status_code == 200
+    body = split.json()
+    assert body["source"] == "gw-01"
+    assert body["silence_interval_seconds"] == 15.0
+    assert body["event_count"] == 4
+    sims = body["simulated_segments"]
+    assert [s["temp_id"] for s in sims] == [1, 2, 3, 4]
+    assert all(s["event_count"] == 1 for s in sims)
+    assert sims[0]["max_severity"] == "warning"
+    assert sims[1]["max_severity"] == "critical"
+    assert [m["relation"] for m in body["mappings"]] == ["split", "split"]
+    assert body["mappings"][0]["simulated_temp_ids"] == [1, 2]
+    assert body["mappings"][1]["simulated_temp_ids"] == [3, 4]
+    summary = body["summary"]
+    assert summary["split_existing_segment_count"] == 2
+    assert summary["merged_existing_segment_count"] == 0
+    assert summary["unchanged_existing_segment_count"] == 0
+    assert summary["changed_existing_segment_count"] == 2
+    assert summary["existing_segment_count"] == 2
+    assert summary["simulated_segment_count"] == 4
+
+    # 更大间隔 600s：合并为 1 个模拟段，2 个 merged
+    merged = client.get(
+        "/segments/resegmentation-preview",
+        params={"source": "gw-01", "silence_interval_seconds": 600},
+    ).json()
+    assert len(merged["simulated_segments"]) == 1
+    merged_seg = merged["simulated_segments"][0]
+    assert merged_seg["temp_id"] == 1
+    assert merged_seg["event_count"] == 4
+    assert merged_seg["max_severity"] == "critical"
+    assert merged_seg["started_at"].replace("Z", "+00:00") == "2026-09-20T08:00:00+00:00"
+    assert merged_seg["ended_at"].replace("Z", "+00:00") == "2026-09-20T08:02:30+00:00"
+    assert [m["relation"] for m in merged["mappings"]] == ["merged", "merged"]
+    assert all(m["simulated_temp_ids"] == [1] for m in merged["mappings"])
+    assert merged["summary"]["merged_existing_segment_count"] == 2
+    assert merged["summary"]["changed_existing_segment_count"] == 2
+
+    # 与生效间隔相同（60s）：全部 unchanged
+    same = client.get(
+        "/segments/resegmentation-preview",
+        params={"source": "gw-01", "silence_interval_seconds": 60},
+    ).json()
+    assert len(same["simulated_segments"]) == 2
+    assert all(m["relation"] == "unchanged" for m in same["mappings"])
+    assert same["summary"]["changed_existing_segment_count"] == 0
+    assert same["summary"]["unchanged_existing_segment_count"] == 2
+
+
+def test_preview_deterministic_and_read_only(client):
+    for i, ts in enumerate(
+        ["08:00:00", "08:00:30", "08:02:00", "08:02:30", "08:05:00"]
+    ):
+        _post(client, "gw-01", f"e{i}", f"2026-09-20T{ts}Z")
+
+    params = {"source": "gw-01", "silence_interval_seconds": 45}
+    first = client.get("/segments/resegmentation-preview", params=params).json()
+    second = client.get("/segments/resegmentation-preview", params=params).json()
+    assert first == second  # 重复请求确定一致
+
+    # 预演不改变现有段与变更流
+    segs = client.get("/segments", params={"source": "gw-01"}).json()
+    changes = client.get("/segment-changes").json()
+    client.get("/segments/resegmentation-preview", params=params)
+    client.get(
+        "/segments/resegmentation-preview",
+        params={"source": "gw-01", "silence_interval_seconds": 1},
+    )
+    assert client.get("/segments", params={"source": "gw-01"}).json() == segs
+    assert client.get("/segment-changes").json() == changes
+
+
+def test_preview_unknown_source_empty(client):
+    body = client.get(
+        "/segments/resegmentation-preview",
+        params={"source": "ghost", "silence_interval_seconds": 60},
+    ).json()
+    assert body["event_count"] == 0
+    assert body["simulated_segments"] == []
+    assert body["mappings"] == []
+    assert body["summary"]["existing_segment_count"] == 0
+    assert body["summary"]["simulated_segment_count"] == 0
+
+
+def test_preview_param_validation(client):
+    # 缺 source
+    r = client.get(
+        "/segments/resegmentation-preview",
+        params={"silence_interval_seconds": 60},
+    )
+    assert r.status_code == 422
+    # 负间隔
+    r = client.get(
+        "/segments/resegmentation-preview",
+        params={"source": "gw-01", "silence_interval_seconds": -1},
+    )
+    assert r.status_code == 422
+    # 非数字间隔
+    r = client.get(
+        "/segments/resegmentation-preview",
+        params={"source": "gw-01", "silence_interval_seconds": "soon"},
+    )
+    assert r.status_code == 422
+    # 零允许（同刻事件才同段）
+    r = client.get(
+        "/segments/resegmentation-preview",
+        params={"source": "gw-01", "silence_interval_seconds": 0},
+    )
+    assert r.status_code == 200
+
+
+def test_preview_route_not_captured_by_segment_id(client):
+    # 静态路径必须优先于 /segments/{segment_id} 匹配，不能返回 422
+    r = client.get(
+        "/segments/resegmentation-preview",
+        params={"source": "gw-01", "silence_interval_seconds": 60},
+    )
+    assert r.status_code == 200
 
 
 def test_healthz(client):

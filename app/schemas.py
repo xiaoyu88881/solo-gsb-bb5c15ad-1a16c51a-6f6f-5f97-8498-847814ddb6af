@@ -65,3 +65,48 @@ class SegmentChangesPage(BaseModel):
 
     changes: list[SegmentChange]
     next_after: int
+
+
+class PreviewSegmentOut(BaseModel):
+    """按候选静默间隔重算出的模拟段；temp_id 仅本次预演响应内有效。"""
+
+    temp_id: int
+    source: str
+    started_at: datetime
+    ended_at: datetime
+    max_severity: str
+    event_count: int
+
+
+class SegmentMappingOut(BaseModel):
+    """单个现有段到模拟段的映射，依据事件成员关系判定：
+
+    - unchanged：该现有段的事件与唯一一个模拟段完全相同（一对一）；
+    - split：该现有段的事件分散到多个模拟段（一对多，候选间隔更小）；
+    - merged：多个现有段的事件并入同一个模拟段（多对一，候选间隔更大）。
+    """
+
+    segment_id: int
+    relation: Literal["unchanged", "split", "merged"]
+    simulated_temp_ids: list[int]
+    event_count: int
+
+
+class ResegmentationSummary(BaseModel):
+    changed_existing_segment_count: int
+    split_existing_segment_count: int
+    merged_existing_segment_count: int
+    unchanged_existing_segment_count: int
+    existing_segment_count: int
+    simulated_segment_count: int
+
+
+class ResegmentationPreviewResponse(BaseModel):
+    """静默间隔重分段预演结果：纯读，不改变任何事件、现有段与变更流。"""
+
+    source: str
+    silence_interval_seconds: float
+    event_count: int
+    simulated_segments: list[PreviewSegmentOut]
+    mappings: list[SegmentMappingOut]
+    summary: ResegmentationSummary

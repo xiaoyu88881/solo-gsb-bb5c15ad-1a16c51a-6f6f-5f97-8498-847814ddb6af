@@ -3,13 +3,14 @@
     python3 -m unittest tests.test_service -v
 """
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.db import init_db, session  # noqa: E402
+from app.db import init_db, read_only_session, session  # noqa: E402
 from app import service  # noqa: E402
 
 SILENCE = 10.0
@@ -236,6 +237,192 @@ class ServiceTestCase(unittest.TestCase):
         self.assertEqual(page, {"changes": [], "next_after": 0})
         page = self.changes(after=42)
         self.assertEqual(page, {"changes": [], "next_after": 42})
+
+    # ---- 静默间隔重分段预演（纯读）----
+
+    def preview(self, source, silence):
+        with read_only_session(self.db_path) as conn:
+            return service.preview_resegmentation(
+                conn, source=source, silence=silence
+            )
+
+    def test_preview_smaller_interval_splits_segments(self):
+        # 当前 SILENCE=10：0、8、20、28、40 → 三段 [0,8]、[20,28]、[40]
+        a = self.submit("s1", "e1", 0.0)["segment"]
+        self.submit("s1", "e2", 8.0)
+        b = self.submit("s1", "e3", 20.0)["segment"]
+        self.submit("s1", "e4", 28.0)
+        c = self.submit("s1", "e5", 40.0)["segment"]
+
+        r = self.preview("s1", 5.0)
+        # 间隔 5：8→20(12)、28→40(12) 切开；0→8(8) 切开 → 五段
+        sims = r["simulated_segments"]
+        self.assertEqual([s["temp_id"] for s in sims], [1, 2, 3, 4, 5])
+        self.assertEqual(
+            [s["event_count"] for s in sims], [1, 1, 1, 1, 1]
+        )
+        self.assertTrue(all(s["source"] == "s1" for s in sims))
+
+        by_id = {m["segment_id"]: m for m in r["mappings"]}
+        self.assertEqual(by_id[a["id"]]["relation"], "split")
+        self.assertEqual(by_id[a["id"]]["simulated_temp_ids"], [1, 2])
+        self.assertEqual(by_id[b["id"]]["relation"], "split")
+        self.assertEqual(by_id[b["id"]]["simulated_temp_ids"], [3, 4])
+        self.assertEqual(by_id[c["id"]]["relation"], "unchanged")
+        self.assertEqual(by_id[c["id"]]["simulated_temp_ids"], [5])
+
+        summary = r["summary"]
+        self.assertEqual(summary["split_existing_segment_count"], 2)
+        self.assertEqual(summary["merged_existing_segment_count"], 0)
+        self.assertEqual(summary["unchanged_existing_segment_count"], 1)
+        self.assertEqual(summary["changed_existing_segment_count"], 2)
+        self.assertEqual(summary["existing_segment_count"], 3)
+        self.assertEqual(summary["simulated_segment_count"], 5)
+        self.assertEqual(r["event_count"], 5)
+
+    def test_preview_larger_interval_merges_segments(self):
+        # 0、8、20、28 → 现有两段 [0,8]、[20,28]
+        a = self.submit("s1", "e1", 0.0)["segment"]
+        self.submit("s1", "e2", 8.0)
+        b = self.submit("s1", "e3", 20.0)["segment"]
+        self.submit("s1", "e4", 28.0)
+
+        r = self.preview("s1", 100.0)
+        sims = r["simulated_segments"]
+        self.assertEqual(len(sims), 1)
+        self.assertEqual(sims[0]["temp_id"], 1)
+        self.assertEqual(sims[0]["event_count"], 4)
+        self.assertEqual(sims[0]["started_at"], "1970-01-01T00:00:00+00:00")
+        self.assertEqual(sims[0]["max_severity"], "info")
+
+        by_id = {m["segment_id"]: m for m in r["mappings"]}
+        self.assertEqual(by_id[a["id"]]["relation"], "merged")
+        self.assertEqual(by_id[a["id"]]["simulated_temp_ids"], [1])
+        self.assertEqual(by_id[b["id"]]["relation"], "merged")
+        self.assertEqual(by_id[b["id"]]["simulated_temp_ids"], [1])
+        self.assertEqual(r["summary"]["merged_existing_segment_count"], 2)
+        self.assertEqual(r["summary"]["changed_existing_segment_count"], 2)
+        self.assertEqual(r["summary"]["split_existing_segment_count"], 0)
+        self.assertEqual(r["summary"]["unchanged_existing_segment_count"], 0)
+
+    def test_preview_equal_interval_all_unchanged(self):
+        a = self.submit("s1", "e1", 0.0)["segment"]
+        self.submit("s1", "e2", 8.0)
+        b = self.submit("s1", "e3", 20.0)["segment"]
+
+        r = self.preview("s1", SILENCE)
+        self.assertEqual(len(r["simulated_segments"]), 2)
+        self.assertTrue(all(m["relation"] == "unchanged" for m in r["mappings"]))
+        self.assertEqual(
+            [m["simulated_temp_ids"] for m in r["mappings"]], [[1], [2]]
+        )
+        self.assertEqual(r["summary"]["changed_existing_segment_count"], 0)
+        self.assertEqual(r["summary"]["unchanged_existing_segment_count"], 2)
+        # 模拟段与现有段边界一致
+        sims = {s["temp_id"]: s for s in r["simulated_segments"]}
+        self.assertEqual(sims[1]["event_count"], 2)
+        self.assertEqual(sims[2]["event_count"], 1)
+
+    def test_preview_boundary_gap_equal_to_interval_joins(self):
+        self.submit("s1", "e1", 0.0)
+        self.submit("s1", "e2", SILENCE)  # 恰好等于间隔 → 同段
+        r = self.preview("s1", SILENCE)
+        self.assertEqual(len(r["simulated_segments"]), 1)
+
+    def test_preview_max_severity_and_timestamps(self):
+        self.submit("s1", "e1", 100.0, "info")
+        self.submit("s1", "e2", 103.0, "critical")
+        self.submit("s1", "e3", 95.0, "warning")  # 乱序到达
+        r = self.preview("s1", 1000.0)
+        seg = r["simulated_segments"][0]
+        self.assertEqual(seg["started_at"], "1970-01-01T00:01:35+00:00")  # 95
+        self.assertEqual(seg["ended_at"], "1970-01-01T00:01:43+00:00")    # 103
+        self.assertEqual(seg["max_severity"], "critical")
+        self.assertEqual(seg["event_count"], 3)
+
+    def test_preview_stable_sort_tiebreaks_same_timestamp_by_event_id(self):
+        self.submit("s1", "b", 0.0)
+        self.submit("s1", "a", 0.0)    # 同刻事件
+        self.submit("s1", "c", 100.0)  # 超静默 → 第二段
+        r = self.preview("s1", 5.0)
+        self.assertEqual(
+            [s["temp_id"] for s in r["simulated_segments"]], [1, 2]
+        )
+        # 同刻事件必在同一段；temp_id 编号按 (occurred_at, event_id) 次序确定
+        self.assertEqual(r["simulated_segments"][0]["event_count"], 2)
+
+    def test_preview_is_isolated_by_source(self):
+        self.submit("s1", "e1", 0.0)
+        self.submit("s2", "e2", 0.0)
+        self.submit("s2", "e3", 100.0)
+        r = self.preview("s2", 5.0)
+        self.assertEqual(r["source"], "s2")
+        self.assertEqual(r["event_count"], 2)
+        self.assertEqual(len(r["simulated_segments"]), 2)
+        self.assertEqual(r["summary"]["existing_segment_count"], 2)
+        self.assertTrue(all(s["source"] == "s2" for s in r["simulated_segments"]))
+
+    def test_preview_unknown_source_is_empty(self):
+        self.submit("s1", "e1", 0.0)
+        r = self.preview("nope", 10.0)
+        self.assertEqual(r["event_count"], 0)
+        self.assertEqual(r["simulated_segments"], [])
+        self.assertEqual(r["mappings"], [])
+        self.assertEqual(
+            r["summary"],
+            {
+                "changed_existing_segment_count": 0,
+                "split_existing_segment_count": 0,
+                "merged_existing_segment_count": 0,
+                "unchanged_existing_segment_count": 0,
+                "existing_segment_count": 0,
+                "simulated_segment_count": 0,
+            },
+        )
+
+    def test_preview_repeated_requests_are_identical(self):
+        for i in range(6):
+            self.submit("s1", f"e{i}", float(i) * 7)
+        r1 = self.preview("s1", 5.0)
+        r2 = self.preview("s1", 5.0)
+        self.assertEqual(r1, r2)
+
+    def test_preview_does_not_mutate_data(self):
+        self.submit("s1", "e1", 0.0)
+        self.submit("s1", "e2", 8.0)
+        self.submit("s1", "e3", 20.0)
+        with session(self.db_path) as conn:
+            segs_before = service.list_segments(conn)
+            changes_before = service.list_segment_changes(conn)
+            events_before = conn.execute("SELECT * FROM events ORDER BY id").fetchall()
+
+        for candidate in (0.0, 5.0, 100.0):
+            self.preview("s1", candidate)
+
+        with session(self.db_path) as conn:
+            segs_after = service.list_segments(conn)
+            changes_after = service.list_segment_changes(conn)
+            events_after = conn.execute("SELECT * FROM events ORDER BY id").fetchall()
+        self.assertEqual(segs_after, segs_before)
+        self.assertEqual(changes_after, changes_before)
+        self.assertEqual(
+            [tuple(e) for e in events_after], [tuple(e) for e in events_before]
+        )
+
+    def test_preview_read_only_session_rejects_writes(self):
+        from app.db import read_only_session
+
+        self.submit("s1", "e1", 0.0)
+        with read_only_session(self.db_path) as conn:
+            with self.assertRaises(sqlite3.OperationalError):
+                conn.execute(
+                    "INSERT INTO segments "
+                    "(source, start_ts, end_ts, max_severity, event_count, "
+                    " revision, created_at, updated_at) "
+                    "VALUES ('x', 0, 0, 'info', 1, 1, 0, 0)"
+                )
+        # 回滚释放后库仍可正常写入
+        self.submit("s1", "e2", 8.0)
 
 
 if __name__ == "__main__":

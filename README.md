@@ -66,6 +66,53 @@ curl http://localhost:8000/segments/1
 curl 'http://localhost:8000/segments?source=edge-gateway-01'
 ```
 
+### 静默间隔重分段预演 `GET /segments/resegmentation-preview`
+
+用**候选静默间隔**对某来源的全部原始事件重新归段，预览"如果改了间隔会变成什么样"。全程**只读**：在同一只读事务（`query_only` 连接）内读取该来源全部事件并按 `occurred_at`、`event_id` 稳定排序后重算，**不会改写事件、现有段或变更流**；模拟段仅以本次响应内有效的临时编号 `temp_id` 标识。
+
+```bash
+curl 'http://localhost:8000/segments/resegmentation-preview?source=edge-gateway-01&silence_interval_seconds=120'
+```
+
+```json
+{
+  "source": "edge-gateway-01",
+  "silence_interval_seconds": 120.0,
+  "event_count": 4,
+  "simulated_segments": [
+    {
+      "temp_id": 1,
+      "source": "edge-gateway-01",
+      "started_at": "2026-09-20T08:00:00+00:00",
+      "ended_at": "2026-09-20T08:02:30+00:00",
+      "max_severity": "critical",
+      "event_count": 4
+    }
+  ],
+  "mappings": [
+    {"segment_id": 1, "relation": "merged", "simulated_temp_ids": [1], "event_count": 2},
+    {"segment_id": 2, "relation": "merged", "simulated_temp_ids": [1], "event_count": 2}
+  ],
+  "summary": {
+    "changed_existing_segment_count": 2,
+    "split_existing_segment_count": 0,
+    "merged_existing_segment_count": 2,
+    "unchanged_existing_segment_count": 0,
+    "existing_segment_count": 2,
+    "simulated_segment_count": 1
+  }
+}
+```
+
+- **`simulated_segments`**：按候选间隔重算出的模拟段（不落库），`temp_id` 从 1 起按时间顺序编号。
+- **`mappings`**：每个**现有段**到模拟段的映射，按现有段 `id` 升序，依据事件成员关系判定：
+  - `unchanged`：现有段与唯一一个模拟段的事件集合完全相同（候选间隔与现状等价）；
+  - `split`：该现有段的事件被拆散到**多个**模拟段（候选间隔**更小**，切分更细）；
+  - `merged`：**多个**现有段的事件并入同一个模拟段（候选间隔**更大**，段被合并）。
+- **`summary`**：受影响（`split` + `merged`）现有段数，以及 split/merged/unchanged 各自计数、现有段总数与模拟段总数。
+- 切分规则：事件按 `(occurred_at, event_id)` 排序后，相邻事件间隔 **大于**候选间隔处切分（恰好等于间隔仍归同段，与归段规则一致）。
+- 相同入参的重复请求结果**确定一致**；`silence_interval_seconds >= 0`（`0` 表示仅同一时刻的事件归同段），未知来源返回各列表为空、计数为 0 的结果。
+
 ### 增量同步变更流 `GET /segment-changes?after=&limit=`
 
 下游系统可按 `change_id` 升序增量拉取事件段变更，实现增量同步：
@@ -121,6 +168,7 @@ curl 'http://localhost:8000/segment-changes?after=0&limit=100'
 - 段的 `revision` 初始为 1；**仅当**新事件导致段的起止边界或最高级别发生变化时递增，仅事件数增加不递增。
 - `(source, event_id)` 唯一约束保证幂等：重复提交直接返回原段，不改计数、不改 revision。
 - 上述每次段创建、边界/最高级别变化与合并都会写入变更流（见 `GET /segment-changes`），供下游增量同步；历史段（变更流上线前已存在）不补录，订阅从部署后的新变更开始。
+- 想评估调整 `SILENCE_INTERVAL_SECONDS` 的影响时，调用重分段预演接口（见 `GET /segments/resegmentation-preview`），可在不改动任何数据的前提下查看模拟段与现有段的 split/merged 映射。
 
 ## 本地开发与测试
 

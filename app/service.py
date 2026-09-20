@@ -14,6 +14,12 @@
   事务内向 segment_changes 追加记录，change_id 单调递增；
 - 合并时为每个被删除段写一条指向保留段的 merged 墓碑；
 - 仅事件数增加（revision 不变）不写 upsert；event_id 幂等重放不写任何记录。
+
+重分段预演（preview_resegmentation，纯读）：
+- 在同一只读事务内读取某 source 全部原始事件，按 (occurred_at, event_id)
+  稳定排序后以候选静默间隔重新切分，得到不落库的模拟段与临时编号；
+- 依据事件成员关系给出每个现有段到模拟段的 unchanged/split/merged 映射；
+- 不写任何表（调用方开启 query_only 双重保险），结果对重复请求确定一致。
 """
 from __future__ import annotations
 
@@ -273,3 +279,127 @@ def ingest_event(
         (segment_id, source, event_id, occurred_ts, severity, now),
     )
     return {"deduplicated": False, "segment": get_segment(conn, segment_id)}
+
+
+def preview_resegmentation(
+    conn: sqlite3.Connection, *, source: str, silence: float
+) -> dict:
+    """按候选静默间隔对某 source 的全部原始事件重新归段（纯读预演）。
+
+    - 仅执行 SELECT：不写 events / segments / segment_changes；调用方还应使用
+      query_only 的只读事务（见 db.read_only_session）双重保证；
+    - 重新归段等价于把事件按 (occurred_at, event_id) 稳定排序后，在相邻事件
+      间隔大于 silence 处切分——这正是增量归段规则收敛后的最终分段；
+    - 排序与临时编号均为确定性行为，相同输入重复请求结果逐字节一致；
+    - 映射依据事件成员关系给出：现有段与模拟段一一对应为 unchanged，
+      一对多为 split，多对一为 merged。
+    """
+    # 同一读事务内一次性读取该来源全部原始事件；Python 侧按
+    # (occurred_at, event_id) 稳定排序，event_id 作为同刻事件的确定次序
+    rows = conn.execute(
+        """
+        SELECT event_id, occurred_at, severity, segment_id
+        FROM events
+        WHERE source = ?
+        """,
+        (source,),
+    ).fetchall()
+    events = sorted(rows, key=lambda r: (r["occurred_at"], r["event_id"]))
+
+    # ---- 按候选间隔重算模拟段 ----
+    simulated: list[dict] = []
+    # 事件 event_id -> 所属模拟段 temp_id（event_id 在同一 source 内唯一）
+    event_sim_index: dict[str, int] = {}
+
+    for event in events:
+        ts = event["occurred_at"]
+        if simulated and ts <= simulated[-1]["end_ts"] + silence:
+            # 与上一个模拟段相邻（含恰好等于间隔的边界）→ 归入
+            seg = simulated[-1]
+            seg["end_ts"] = ts
+            seg["max_severity"] = sev.highest(seg["max_severity"], event["severity"])
+            seg["event_count"] += 1
+        else:
+            # 与上一段间隔超过 silence → 开新段；temp_id 从 1 起按时间序编号
+            simulated.append(
+                {
+                    "temp_id": len(simulated) + 1,
+                    "source": source,
+                    "start_ts": ts,
+                    "end_ts": ts,
+                    "max_severity": event["severity"],
+                    "event_count": 1,
+                }
+            )
+        event_sim_index[event["event_id"]] = simulated[-1]["temp_id"]
+
+    # ---- 依据事件成员关系构建现有段 -> 模拟段映射（同一读事务内读取）----
+    existing_rows = conn.execute(
+        "SELECT id FROM segments WHERE source = ? ORDER BY id", (source,)
+    ).fetchall()
+    existing_ids = [r["id"] for r in existing_rows]
+
+    # 模拟段 temp_id -> 含多少个不同现有段（用于反向判定 merged）
+    sim_to_existing: dict[int, set[int]] = {s["temp_id"]: set() for s in simulated}
+    # 现有段 id -> 覆盖到的模拟段 temp_id 有序集合
+    existing_to_sims: dict[int, list[int]] = {sid: [] for sid in existing_ids}
+    existing_counts: dict[int, int] = {sid: 0 for sid in existing_ids}
+
+    for event in events:
+        sid = event["segment_id"]
+        temp_id = event_sim_index[event["event_id"]]
+        sim_to_existing[temp_id].add(sid)
+        if sid in existing_to_sims and (
+            not existing_to_sims[sid] or existing_to_sims[sid][-1] != temp_id
+        ):
+            # 事件已按时间排序，落入的模拟段 temp_id 单调不减，去重追加即可
+            existing_to_sims[sid].append(temp_id)
+        existing_counts[sid] = existing_counts.get(sid, 0) + 1
+
+    mappings: list[dict] = []
+    split_count = merged_count = unchanged_count = 0
+    for sid in existing_ids:  # 按现有段 id 升序，保证输出确定
+        temp_ids = existing_to_sims.get(sid, [])
+        if len(temp_ids) == 1 and len(sim_to_existing[temp_ids[0]]) == 1:
+            relation = "unchanged"
+            unchanged_count += 1
+        elif len(temp_ids) > 1:
+            relation = "split"
+            split_count += 1
+        else:
+            relation = "merged"
+            merged_count += 1
+        mappings.append(
+            {
+                "segment_id": sid,
+                "relation": relation,
+                "simulated_temp_ids": temp_ids,
+                "event_count": existing_counts.get(sid, 0),
+            }
+        )
+
+    return {
+        "source": source,
+        "silence_interval_seconds": silence,
+        "event_count": len(events),
+        "simulated_segments": [
+            {
+                "temp_id": s["temp_id"],
+                "source": s["source"],
+                "started_at": _iso(s["start_ts"]),
+                "ended_at": _iso(s["end_ts"]),
+                "max_severity": s["max_severity"],
+                "event_count": s["event_count"],
+            }
+            for s in simulated
+        ],
+        "mappings": mappings,
+        "summary": {
+            "changed_existing_segment_count": split_count + merged_count,
+            "split_existing_segment_count": split_count,
+            "merged_existing_segment_count": merged_count,
+            "unchanged_existing_segment_count": unchanged_count,
+            "existing_segment_count": len(existing_ids),
+            "simulated_segment_count": len(simulated),
+        },
+    }

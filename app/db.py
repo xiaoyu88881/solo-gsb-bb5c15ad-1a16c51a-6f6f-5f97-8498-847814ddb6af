@@ -77,3 +77,24 @@ def session(db_path: str):
         raise
     finally:
         conn.close()
+
+
+@contextmanager
+def read_only_session(db_path: str):
+    """只读事务上下文：所有读在同一快照内完成，结束以回滚释放事务。
+
+    - 显式 BEGIN 开启延迟读事务，多次 SELECT 共享同一快照；
+    - query_only=ON 使任何 INSERT/UPDATE/DELETE/DDL 直接报错，
+      从机制上杜绝预演逻辑误写事件、段或变更流。
+    """
+    conn = connect(db_path)
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("BEGIN")
+        yield conn
+        conn.rollback()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
