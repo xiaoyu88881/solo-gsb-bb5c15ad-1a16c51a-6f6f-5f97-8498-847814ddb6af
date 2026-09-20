@@ -77,3 +77,22 @@ def session(db_path: str):
         raise
     finally:
         conn.close()
+
+
+@contextmanager
+def read_session(db_path: str):
+    """只读事务上下文：全程禁止任何写操作。
+
+    以 DEFERRED 事务开启一致快照读，query_only=ON 在 SQLite 层拒绝写语句；
+    结束时统一 ROLLBACK，绝不提交——用于预演等不得改写数据的场景。
+    """
+    conn = connect(db_path)
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("BEGIN")
+        try:
+            yield conn
+        finally:
+            conn.rollback()
+    finally:
+        conn.close()

@@ -1,6 +1,7 @@
 """API 请求/响应模型。"""
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -65,3 +66,55 @@ class SegmentChangesPage(BaseModel):
 
     changes: list[SegmentChange]
     next_after: int
+
+
+class ResegmentPreviewIn(BaseModel):
+    """静默间隔重分段预演请求：指定来源与候选静默间隔（秒）。"""
+
+    source: str = Field(min_length=1, max_length=256, examples=["edge-gateway-01"])
+    silence_interval_seconds: float = Field(
+        ge=0, examples=[120], description="候选静默间隔（秒）"
+    )
+
+    @field_validator("silence_interval_seconds")
+    @classmethod
+    def _must_be_finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("silence_interval_seconds 必须是有限数值")
+        return v
+
+
+class SimulatedSegmentOut(BaseModel):
+    """按候选间隔重新计算得到的模拟段（仅存在于响应中，不入库）。"""
+
+    temp_id: int = Field(description="模拟段临时编号，按时间升序从 1 开始")
+    source: str
+    started_at: datetime
+    ended_at: datetime
+    max_severity: str
+    event_count: int
+
+
+class SegmentMappingOut(BaseModel):
+    """单个现有段到模拟段的映射，依据事件成员关系判定。"""
+
+    segment_id: int
+    status: Literal["unchanged", "split", "merged"]
+    simulated_temp_ids: list[int] = Field(
+        description="该现有段事件落入的模拟段临时编号（升序）"
+    )
+
+
+class ResegmentPreviewResponse(BaseModel):
+    """重分段预演结果：模拟段、现有段映射与受影响段汇总。"""
+
+    source: str
+    silence_interval_seconds: float
+    simulated_segments: list[SimulatedSegmentOut]
+    mappings: list[SegmentMappingOut]
+    affected_count: int = Field(
+        description="受影响（split 或 merged）的现有段数"
+    )
+    unchanged_count: int
+    split_count: int
+    merged_count: int

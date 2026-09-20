@@ -68,8 +68,9 @@ def test_late_out_of_order_event_bumps_revision(client):
     seg = late["segment"]
     assert seg["revision"] == 2
     assert seg["max_severity"] == "error"
-    assert seg["started_at"] == "2026-09-20T08:00:00+00:00"
-    assert seg["ended_at"] == "2026-09-20T08:00:30+00:00"
+    # pydantic >=2.7 将 UTC 序列化为 ...Z，旧版为 ...+00:00，两者等价
+    assert seg["started_at"].replace("Z", "+00:00") == "2026-09-20T08:00:00+00:00"
+    assert seg["ended_at"].replace("Z", "+00:00") == "2026-09-20T08:00:30+00:00"
     assert seg["event_count"] == 2
 
 
@@ -182,3 +183,110 @@ def test_segment_changes_param_validation(client):
 
 def test_healthz(client):
     assert client.get("/healthz").json() == {"status": "ok"}
+
+
+# ---- 静默间隔重分段预演（只读）----
+
+def test_resegment_preview_merge_split_and_readonly(client):
+    # 服务 silence=60：0s、30s 同段 A；120s 与前段相距 90>60 → 段 B
+    a = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    _post(client, "gw-01", "e2", "2026-09-20T08:00:30Z")
+    b = _post(client, "gw-01", "e3", "2026-09-20T08:02:00Z")["segment"]
+
+    # 候选间隔 120s：30->120 相距 90<=120 → A、B 合并为一个模拟段
+    resp = client.post("/segments/resegment-preview", json={
+        "source": "gw-01", "silence_interval_seconds": 120,
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "gw-01"
+    assert body["silence_interval_seconds"] == 120.0
+    assert len(body["simulated_segments"]) == 1
+    sim = body["simulated_segments"][0]
+    assert sim["temp_id"] == 1
+    assert sim["event_count"] == 3
+    # pydantic >=2.7 将 UTC 序列化为 ...Z，旧版为 ...+00:00，两者等价
+    assert sim["started_at"].replace("Z", "+00:00") == "2026-09-20T08:00:00+00:00"
+    assert sim["ended_at"].replace("Z", "+00:00") == "2026-09-20T08:02:00+00:00"
+    assert [m["segment_id"] for m in body["mappings"]] == [a["id"], b["id"]]
+    assert all(m["status"] == "merged" for m in body["mappings"])
+    assert all(m["simulated_temp_ids"] == [1] for m in body["mappings"])
+    assert body["affected_count"] == 2
+    assert (body["unchanged_count"], body["split_count"], body["merged_count"]) == (0, 0, 2)
+
+    # 候选间隔 20s：0->30 断开、30->120 断开 → A(e1,e2) 拆为 temp1/temp2
+    resp = client.post("/segments/resegment-preview", json={
+        "source": "gw-01", "silence_interval_seconds": 20,
+    })
+    body = resp.json()
+    assert [(s["temp_id"], s["event_count"]) for s in body["simulated_segments"]] == [
+        (1, 1), (2, 1), (3, 1),
+    ]
+    amap = next(m for m in body["mappings"] if m["segment_id"] == a["id"])
+    bmap = next(m for m in body["mappings"] if m["segment_id"] == b["id"])
+    assert amap["status"] == "split" and amap["simulated_temp_ids"] == [1, 2]
+    assert bmap["status"] == "unchanged" and bmap["simulated_temp_ids"] == [3]
+    assert body["affected_count"] == 1
+    assert (body["unchanged_count"], body["split_count"], body["merged_count"]) == (1, 1, 0)
+
+    # 预演不改数据：现有段与变更流保持原样
+    assert len(client.get("/segments", params={"source": "gw-01"}).json()) == 2
+    page = client.get("/segment-changes").json()
+    assert [c["type"] for c in page["changes"]] == ["upsert", "upsert", "upsert"]
+
+
+def test_resegment_preview_same_silence_all_unchanged(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "error")["segment"]
+    body = client.post("/segments/resegment-preview", json={
+        "source": "gw-01", "silence_interval_seconds": 60,
+    }).json()
+    assert len(body["simulated_segments"]) == 1
+    sim = body["simulated_segments"][0]
+    assert sim["event_count"] == 1
+    assert sim["max_severity"] == "error"
+    assert body["mappings"] == [
+        {"segment_id": seg["id"], "status": "unchanged", "simulated_temp_ids": [1]}
+    ]
+    assert body["affected_count"] == 0
+    assert body["unchanged_count"] == 1
+
+
+def test_resegment_preview_is_deterministic(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")
+    _post(client, "gw-01", "e2", "2026-09-20T08:01:00Z")
+    payload = {"source": "gw-01", "silence_interval_seconds": 30}
+    first = client.post("/segments/resegment-preview", json=payload).json()
+    second = client.post("/segments/resegment-preview", json=payload).json()
+    assert first == second
+
+
+def test_resegment_preview_unknown_source_empty(client):
+    body = client.post("/segments/resegment-preview", json={
+        "source": "ghost", "silence_interval_seconds": 60,
+    }).json()
+    assert body == {
+        "source": "ghost",
+        "silence_interval_seconds": 60.0,
+        "simulated_segments": [],
+        "mappings": [],
+        "affected_count": 0,
+        "unchanged_count": 0,
+        "split_count": 0,
+        "merged_count": 0,
+    }
+
+
+def test_resegment_preview_param_validation(client):
+    # 负间隔被拒
+    resp = client.post("/segments/resegment-preview", json={
+        "source": "gw-01", "silence_interval_seconds": -1,
+    })
+    assert resp.status_code == 422
+    # 空 source 被拒
+    resp = client.post("/segments/resegment-preview", json={
+        "source": "", "silence_interval_seconds": 60,
+    })
+    assert resp.status_code == 422
+    # 缺字段被拒
+    resp = client.post("/segments/resegment-preview", json={"source": "gw-01"})
+    assert resp.status_code == 422

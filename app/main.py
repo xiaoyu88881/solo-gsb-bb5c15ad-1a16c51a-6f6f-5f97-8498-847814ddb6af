@@ -7,8 +7,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 
 from .config import Settings
-from .db import init_db, session
-from .schemas import EventIn, IngestResponse, SegmentChangesPage, SegmentOut
+from .db import init_db, read_session, session
+from .schemas import (
+    EventIn,
+    IngestResponse,
+    ResegmentPreviewIn,
+    ResegmentPreviewResponse,
+    SegmentChangesPage,
+    SegmentOut,
+)
 from . import service
 
 # SQLite 单写者：进程内串行化归段写入，配合事务保证合并一致性
@@ -72,6 +79,21 @@ def create_app(settings: Settings) -> FastAPI:
         """
         with session(settings.database_path) as conn:
             return service.list_segment_changes(conn, after=after, limit=limit)
+
+    @app.post("/segments/resegment-preview", response_model=ResegmentPreviewResponse)
+    def preview_resegmentation(req: ResegmentPreviewIn) -> dict:
+        """静默间隔重分段预演（只读）。
+
+        在同一 SQLite 只读事务内读取该 source 全部原始事件，按
+        (occurred_at, event_id) 稳定排序后以候选间隔重新计算分段；
+        不改写事件、现有段与变更流，重复请求结果确定一致。
+        """
+        with read_session(settings.database_path) as conn:
+            return service.preview_resegment(
+                conn,
+                source=req.source,
+                silence=req.silence_interval_seconds,
+            )
 
     return app
 

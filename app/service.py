@@ -57,6 +57,112 @@ def list_segments(conn: sqlite3.Connection, source: str | None = None) -> list[d
     return [_row_to_segment(r) for r in rows]
 
 
+def preview_resegment(
+    conn: sqlite3.Connection, *, source: str, silence: float
+) -> dict:
+    """静默间隔重分段预演（只读，不写任何表）。
+
+    调用方需持有只读事务（见 db.read_session）。在同一读事务内读取该 source
+    的全部原始事件，按 (occurred_at, event_id) 稳定排序后，用候选间隔
+    重新扫描分段：相邻事件时间差 > silence 处断开，<= silence 归入同一段
+    （与在线归段“落在彼此 silence 窗口内即同段”的最终划分一致）。
+
+    再依据事件成员关系，给出每个现有段到模拟段的映射：
+    - unchanged：现有段与某模拟段事件集合完全相同；
+    - split：现有段的事件散落到 >=2 个模拟段；
+    - merged：现有段事件全部落入 1 个模拟段，但该模拟段还含其他现有段的事件。
+
+    结果仅依赖已提交数据，重复调用确定一致。
+    """
+    # 同一读事务内：该来源的全部原始事件（稳定排序）+ 现有段
+    event_rows = conn.execute(
+        """
+        SELECT event_id, occurred_at, severity, segment_id
+        FROM events
+        WHERE source = ?
+        ORDER BY occurred_at, event_id
+        """,
+        (source,),
+    ).fetchall()
+    segment_rows = conn.execute(
+        "SELECT id FROM segments WHERE source = ? ORDER BY id",
+        (source,),
+    ).fetchall()
+
+    # 稳定排序后重新扫描分段
+    groups: list[list[sqlite3.Row]] = []
+    for row in event_rows:
+        if (
+            not groups
+            or row["occurred_at"] - groups[-1][-1]["occurred_at"] > silence
+        ):
+            groups.append([row])
+        else:
+            groups[-1].append(row)
+
+    # 构建模拟段（临时编号按时间升序从 1 开始）及其事件集合
+    simulated: list[dict] = []
+    sim_event_sets: list[set[tuple[float, str]]] = []
+    # 事件 (occurred_at, event_id) -> 模拟段临时编号
+    temp_by_event: dict[tuple[float, str], int] = {}
+    for temp_id, members in enumerate(groups, start=1):
+        start_ts = members[0]["occurred_at"]
+        end_ts = members[-1]["occurred_at"]
+        sim_event_sets.append(set())
+        for m in members:
+            key = (m["occurred_at"], m["event_id"])
+            sim_event_sets[-1].add(key)
+            temp_by_event[key] = temp_id
+        simulated.append(
+            {
+                "temp_id": temp_id,
+                "source": source,
+                "started_at": _iso(start_ts),
+                "ended_at": _iso(end_ts),
+                "max_severity": sev.highest(*[m["severity"] for m in members]),
+                "event_count": len(members),
+            }
+        )
+
+    # 现有段 -> 其事件落入的模拟段（升序去重），按事件成员关系判定映射
+    mappings: list[dict] = []
+    split_count = merged_count = unchanged_count = 0
+    for seg_row in segment_rows:
+        seg_id = seg_row["id"]
+        old_event_set = {
+            (r["occurred_at"], r["event_id"])
+            for r in event_rows
+            if r["segment_id"] == seg_id
+        }
+        temp_ids = sorted({temp_by_event[k] for k in old_event_set})
+        if len(temp_ids) >= 2:
+            status = "split"
+            split_count += 1
+        elif len(temp_ids) == 1 and old_event_set == sim_event_sets[temp_ids[0] - 1]:
+            # 事件集合完全相同（模拟段的事件全部来自该现有段）
+            status = "unchanged"
+            unchanged_count += 1
+        else:
+            # 全部落入一个模拟段，但该模拟段还含其他现有段的事件
+            # （该 source 无事件的空段亦归此，模拟划分中没有对应段）
+            status = "merged"
+            merged_count += 1
+        mappings.append(
+            {"segment_id": seg_id, "status": status, "simulated_temp_ids": temp_ids}
+        )
+
+    return {
+        "source": source,
+        "silence_interval_seconds": silence,
+        "simulated_segments": simulated,
+        "mappings": mappings,
+        "affected_count": split_count + merged_count,
+        "unchanged_count": unchanged_count,
+        "split_count": split_count,
+        "merged_count": merged_count,
+    }
+
+
 def _record_change(
     conn: sqlite3.Connection,
     *,

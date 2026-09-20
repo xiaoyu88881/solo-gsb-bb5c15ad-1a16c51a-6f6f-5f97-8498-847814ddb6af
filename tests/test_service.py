@@ -4,12 +4,13 @@
 """
 import os
 import sys
+import sqlite3
 import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.db import init_db, session  # noqa: E402
+from app.db import init_db, read_session, session  # noqa: E402
 from app import service  # noqa: E402
 
 SILENCE = 10.0
@@ -43,6 +44,12 @@ class ServiceTestCase(unittest.TestCase):
     def changes(self, after=0, limit=100):
         with session(self.db_path) as conn:
             return service.list_segment_changes(conn, after=after, limit=limit)
+
+    def preview(self, source, silence):
+        with read_session(self.db_path) as conn:
+            return service.preview_resegment(
+                conn, source=source, silence=silence
+            )
 
     def test_first_event_creates_segment(self):
         r = self.submit("s1", "e1", 1000.0, "warning")
@@ -236,6 +243,148 @@ class ServiceTestCase(unittest.TestCase):
         self.assertEqual(page, {"changes": [], "next_after": 0})
         page = self.changes(after=42)
         self.assertEqual(page, {"changes": [], "next_after": 42})
+
+    # ---- 静默间隔重分段预演（只读）----
+
+    def test_preview_unknown_source_is_empty(self):
+        r = self.preview("nope", SILENCE)
+        self.assertEqual(r["source"], "nope")
+        self.assertEqual(r["simulated_segments"], [])
+        self.assertEqual(r["mappings"], [])
+        self.assertEqual(
+            (r["affected_count"], r["unchanged_count"],
+             r["split_count"], r["merged_count"]),
+            (0, 0, 0, 0),
+        )
+
+    def test_preview_same_silence_all_unchanged(self):
+        seg = self.submit("s1", "e1", 1000.0, "warning")["segment"]
+        self.submit("s1", "e2", 1005.0, "error")
+        self.submit("s1", "e3", 1100.0)  # 与前段相距 95 → 新段
+        r = self.preview("s1", SILENCE)
+        self.assertEqual(len(r["simulated_segments"]), 2)
+        sim0 = r["simulated_segments"][0]
+        self.assertEqual(sim0["temp_id"], 1)
+        self.assertEqual(sim0["event_count"], 2)
+        self.assertEqual(sim0["max_severity"], "error")
+        self.assertEqual(r["simulated_segments"][1]["temp_id"], 2)
+        statuses = {m["segment_id"]: m["status"] for m in r["mappings"]}
+        self.assertTrue(all(s == "unchanged" for s in statuses.values()))
+        self.assertEqual(len(r["mappings"]), 2)
+        for m in r["mappings"]:
+            self.assertEqual(len(m["simulated_temp_ids"]), 1)
+        self.assertIn(seg["id"], statuses)
+        self.assertEqual(
+            (r["affected_count"], r["split_count"], r["merged_count"]),
+            (0, 0, 0),
+        )
+        self.assertEqual(r["unchanged_count"], 2)
+
+    def test_preview_smaller_silence_splits(self):
+        a = self.submit("s1", "e1", 1000.0)["segment"]
+        self.submit("s1", "e2", 1005.0)
+        self.submit("s1", "e3", 1010.0)  # 5s 间隔，在线 SILENCE=10 下同一大段
+        r = self.preview("s1", 4.0)
+        self.assertEqual([s["event_count"] for s in r["simulated_segments"]], [1, 1, 1])
+        self.assertEqual([s["temp_id"] for s in r["simulated_segments"]], [1, 2, 3])
+        self.assertEqual(len(r["mappings"]), 1)
+        m = r["mappings"][0]
+        self.assertEqual(m["segment_id"], a["id"])
+        self.assertEqual(m["status"], "split")
+        self.assertEqual(m["simulated_temp_ids"], [1, 2, 3])
+        self.assertEqual(
+            (r["affected_count"], r["split_count"], r["merged_count"]),
+            (1, 1, 0),
+        )
+        self.assertEqual(r["unchanged_count"], 0)
+
+    def test_preview_larger_silence_merges(self):
+        a = self.submit("s1", "e1", 1000.0)["segment"]
+        b = self.submit("s1", "e2", 1011.0)["segment"]  # 间隔 11 > 10 → 新段
+        c = self.submit("s1", "e3", 1022.0)["segment"]  # 再间隔 11 → 第三段
+        self.assertEqual(len({a["id"], b["id"], c["id"]}), 3)
+        r = self.preview("s1", 15.0)
+        self.assertEqual(len(r["simulated_segments"]), 1)
+        sim = r["simulated_segments"][0]
+        self.assertEqual(sim["temp_id"], 1)
+        self.assertEqual(sim["event_count"], 3)
+        self.assertEqual(r["silence_interval_seconds"], 15.0)
+        self.assertEqual([m["segment_id"] for m in r["mappings"]], [a["id"], b["id"], c["id"]])
+        self.assertTrue(all(m["status"] == "merged" for m in r["mappings"]))
+        self.assertTrue(all(m["simulated_temp_ids"] == [1] for m in r["mappings"]))
+        self.assertEqual(
+            (r["affected_count"], r["split_count"], r["merged_count"]),
+            (3, 0, 3),
+        )
+        self.assertEqual(r["unchanged_count"], 0)
+
+    def test_preview_split_and_merge_in_same_result(self):
+        # 在线 SILENCE=10：e1@0、e2@8 同属段 A；e3@25（与 e2 相距 17>10）为段 B
+        a = self.submit("s1", "e1", 0.0)["segment"]
+        self.submit("s1", "e2", 8.0)
+        b = self.submit("s1", "e3", 25.0)["segment"]
+        self.assertNotEqual(a["id"], b["id"])
+        # 候选 15：间隔 8<=15、17>15 → 划分与在线一致，两段都 unchanged
+        r = self.preview("s1", 15.0)
+        self.assertEqual(len(r["simulated_segments"]), 2)
+        self.assertTrue(all(m["status"] == "unchanged" for m in r["mappings"]))
+        # 候选 17：间隔 17<=17 → 全部并入一段，A、B 均 merged
+        r2 = self.preview("s1", 17.0)
+        self.assertEqual(len(r2["simulated_segments"]), 1)
+        self.assertTrue(all(m["status"] == "merged" for m in r2["mappings"]))
+        # 候选 7：间隔 8>7、17>7 → A(e1,e2) 拆为 temp1、temp2，B(e3) 为 temp3
+        r3 = self.preview("s1", 7.0)
+        self.assertEqual(len(r3["simulated_segments"]), 3)
+        amap = next(m for m in r3["mappings"] if m["segment_id"] == a["id"])
+        bmap = next(m for m in r3["mappings"] if m["segment_id"] == b["id"])
+        self.assertEqual(amap["status"], "split")
+        self.assertEqual(amap["simulated_temp_ids"], [1, 2])
+        self.assertEqual(bmap["status"], "unchanged")
+        self.assertEqual(bmap["simulated_temp_ids"], [3])
+        self.assertEqual(
+            (r3["affected_count"], r3["split_count"], r3["merged_count"],
+             r3["unchanged_count"]),
+            (1, 1, 0, 1),
+        )
+
+    def test_preview_is_read_only_and_deterministic(self):
+        self.submit("s1", "e1", 1000.0)
+        self.submit("s1", "e2", 1005.0)
+        self.submit("s1", "e3", 1100.0)
+        before_segments = self.changes()["changes"]
+        with session(self.db_path) as conn:
+            segs_before = service.list_segments(conn, "s1")
+        r1 = self.preview("s1", 4.0)
+        r2 = self.preview("s1", 4.0)
+        self.assertEqual(r1, r2)  # 重复请求确定一致
+        with session(self.db_path) as conn:
+            self.assertEqual(service.list_segments(conn, "s1"), segs_before)
+        self.assertEqual(self.changes()["changes"], before_segments)  # 变更流未追加
+
+    def test_preview_read_transaction_rejects_writes(self):
+        self.submit("s1", "e1", 1000.0)
+        with read_session(self.db_path) as conn:
+            with self.assertRaises(sqlite3.Error):
+                conn.execute("UPDATE segments SET revision = 999 WHERE id = 1")
+        seg = self.get(1)
+        self.assertEqual(seg["revision"], 1)  # 回滚，未被改写
+
+    def test_preview_stable_order_by_occurred_at_then_event_id(self):
+        # 相同 occurred_at 不同 event_id：稳定排序不应影响划分
+        self.submit("s1", "b", 1000.0)
+        self.submit("s1", "a", 1000.0)
+        self.submit("s1", "c", 1000.0)
+        r = self.preview("s1", 0.0)  # 间隔 0：同时刻仍同段
+        self.assertEqual(len(r["simulated_segments"]), 1)
+        self.assertEqual(r["simulated_segments"][0]["event_count"], 3)
+
+    def test_preview_isolates_sources(self):
+        self.submit("s1", "e1", 1000.0)
+        self.submit("s2", "e2", 1001.0)
+        r = self.preview("s1", SILENCE)
+        self.assertEqual(len(r["simulated_segments"]), 1)
+        self.assertEqual(r["simulated_segments"][0]["source"], "s1")
+        self.assertEqual(len(r["mappings"]), 1)
 
 
 if __name__ == "__main__":

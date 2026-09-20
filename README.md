@@ -113,6 +113,50 @@ curl 'http://localhost:8000/segment-changes?after=0&limit=100'
 - **分页约定**：用上一页返回的 `next_after` 作为下一页的 `after` 继续拉取；`change_id` 单调递增保证分页期间新写入的变更只会出现在后续页——不漏读、不重复。返回空页时 `next_after` 与入参 `after` 相同，可直接继续轮询。
 - `after` 默认 `0`（从头开始）；`limit` 默认 `100`，最大 `1000`。
 
+### 静默间隔重分段预演 `POST /segments/resegment-preview`
+
+在**不改动任何数据**的前提下，预演某个来源若换用候选静默间隔会如何重新分段。接口在**同一 SQLite 只读事务**中读取该来源的全部原始事件，按 `occurred_at`、`event_id` 稳定排序后重新扫描分段（相邻事件时间差 `> 间隔` 处断开），返回模拟段（带临时编号 `temp_id`）以及每个**现有段 → 模拟段**的成员关系映射。不改写事件、现有段，不追加变更流；同一输入重复调用结果确定一致。
+
+```bash
+curl -X POST http://localhost:8000/segments/resegment-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"source": "edge-gateway-01", "silence_interval_seconds": 120}'
+```
+
+```json
+{
+  "source": "edge-gateway-01",
+  "silence_interval_seconds": 120.0,
+  "simulated_segments": [
+    {
+      "temp_id": 1,
+      "source": "edge-gateway-01",
+      "started_at": "2026-09-20T08:00:00+00:00",
+      "ended_at": "2026-09-20T08:02:20+00:00",
+      "max_severity": "critical",
+      "event_count": 4
+    }
+  ],
+  "mappings": [
+    {"segment_id": 1, "status": "merged", "simulated_temp_ids": [1]},
+    {"segment_id": 2, "status": "merged", "simulated_temp_ids": [1]}
+  ],
+  "affected_count": 2,
+  "unchanged_count": 0,
+  "split_count": 0,
+  "merged_count": 2
+}
+```
+
+- `simulated_segments[].temp_id`：模拟段临时编号（**非真实段 id，不入库**），按开始时间升序从 `1` 开始，便于在映射中引用。
+- `mappings[].status` 依据事件成员关系判定，三者互斥：
+  - `unchanged`：现有段与某个模拟段的事件集合完全相同；
+  - `split`：现有段的事件散落到 **2 个及以上**模拟段（间隔变小，段被拆开）；
+  - `merged`：现有段事件全部落入 **1 个**模拟段，但该模拟段还包含其他现有段的事件（间隔变大，多段合一）。
+- `affected_count` = `split_count` + `merged_count`，即若现在应用候选间隔会受影响的现有段数；`mappings` 按 `segment_id` 升序。
+- 来源不存在或暂无事件时返回 `200` 且模拟段、映射均为空列表（不视为错误）。
+- `silence_interval_seconds` 为非负有限数值（秒），非法或缺失返回 `422`。
+
 ### 健康检查 `GET /healthz`
 
 ## 归段与 revision 规则
